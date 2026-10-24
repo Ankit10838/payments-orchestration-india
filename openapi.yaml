@@ -1,0 +1,413 @@
+openapi: 3.0.3
+info:
+  title: Payments Orchestration API (India) - Sandbox
+  version: 0.1.0
+  description: |
+    Unified API over UPI, cards, net banking and mandates, with automatic failover
+    across providers. **Sandbox only: all providers are mocked.** Amounts are in paise
+    (49900 = INR 499.00).
+servers:
+  - url: http://localhost:8000
+    description: Local sandbox
+security:
+  - bearerAuth: []
+tags:
+  - name: Payments
+  - name: Refunds
+  - name: Mandates
+  - name: Settlements
+paths:
+  /v1/payment_intents:
+    post:
+      tags: [Payments]
+      summary: Create a payment intent
+      description: |
+        Creates a payment and starts the first attempt on the best provider.
+        Retrying with the same `Idempotency-Key` returns the original response and never creates a second charge.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePaymentIntent'
+            example:
+              amount: 49900
+              currency: INR
+              method: upi
+              customer: { id: cust_123, email: a@example.com }
+              metadata: { order_id: order_1001 }
+      responses:
+        '201':
+          description: Payment intent created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '200':
+          description: Idempotent replay of an earlier request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/payment_intents/{id}:
+    get:
+      tags: [Payments]
+      summary: Retrieve a payment intent and its attempts
+      parameters:
+        - $ref: '#/components/parameters/PaymentIntentId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/payment_intents/{id}/cancel:
+    post:
+      tags: [Payments]
+      summary: Cancel an intent that has not succeeded
+      parameters:
+        - $ref: '#/components/parameters/PaymentIntentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Canceled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Intent is not in a cancelable state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/payment_intents/{id}/refunds:
+    post:
+      tags: [Refunds]
+      summary: Refund a successful payment (full or partial)
+      parameters:
+        - $ref: '#/components/parameters/PaymentIntentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRefund'
+            example: { amount: 10000, reason: customer_request }
+      responses:
+        '201':
+          description: Refund created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: Amount exceeds refundable balance or payment not successful
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/mandates:
+    post:
+      tags: [Mandates]
+      summary: Create a recurring payment mandate (UPI AutoPay or NACH)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMandate' }
+            example:
+              type: upi_autopay
+              max_amount: 200000
+              frequency: monthly
+              start_date: '2026-11-01'
+              end_date: '2027-10-31'
+              customer: { id: cust_123 }
+      responses:
+        '201':
+          description: Mandate created (pending customer approval)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mandate' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /v1/mandates/{id}:
+    get:
+      tags: [Mandates]
+      summary: Retrieve a mandate
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Mandate' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/settlements:
+    get:
+      tags: [Settlements]
+      summary: List reconciliation results
+      parameters:
+        - { name: date_from, in: query, schema: { type: string, format: date } }
+        - { name: date_to, in: query, schema: { type: string, format: date } }
+        - { name: provider, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [matched, unmatched, disputed] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SettlementRecord' }
+                  next_cursor: { type: string, nullable: true }
+webhooks:
+  paymentEvent:
+    post:
+      summary: Event sent to the merchant's webhook URL
+      description: |
+        Signed with HMAC-SHA256 of the raw body using the merchant webhook secret, sent in
+        `X-Signature`. Respond 2xx within 10 seconds. Failed deliveries retry with
+        exponential backoff (for example 1m, 5m, 30m, 2h, 12h) and then move to a dead-letter queue.
+        Deduplicate on `id`; events can be delivered more than once.
+      parameters:
+        - { name: X-Signature, in: header, required: true, schema: { type: string } }
+        - { name: X-Event-Timestamp, in: header, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEvent' }
+            example:
+              id: evt_01H8
+              type: payment_intent.succeeded
+              created: '2026-10-24T10:15:00Z'
+              data: { object: { id: pi_123, status: succeeded, amount: 49900, currency: INR } }
+      responses:
+        '200': { description: Acknowledged }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Secret API key, for example `sk_test_...`
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique key (max 255 chars) per logical request. Keys are retained for 24 hours.
+      schema: { type: string, maxLength: 255 }
+    PaymentIntentId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, example: pi_123 }
+  schemas:
+    CreatePaymentIntent:
+      type: object
+      required: [amount, currency, method]
+      properties:
+        amount: { type: integer, minimum: 100, description: Amount in paise }
+        currency: { type: string, enum: [INR] }
+        method:
+          type: string
+          enum: [upi, card, netbanking]
+        upi:
+          type: object
+          description: Required when method is upi
+          properties:
+            flow: { type: string, enum: [intent, collect, qr] }
+            vpa: { type: string, example: name@bank }
+        card:
+          type: object
+          description: Required when method is card. Tokenised cards only; raw card numbers are not accepted.
+          properties:
+            token: { type: string }
+        netbanking:
+          type: object
+          properties:
+            bank_code: { type: string }
+        customer:
+          type: object
+          properties:
+            id: { type: string }
+            email: { type: string, format: email }
+            phone: { type: string }
+        return_url: { type: string, format: uri }
+        routing_hint:
+          type: object
+          description: Optional preference; the engine may override on failure.
+          properties:
+            preferred_provider: { type: string }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+    PaymentIntent:
+      type: object
+      properties:
+        id: { type: string, example: pi_123 }
+        status:
+          type: string
+          enum: [created, pending, succeeded, failed, canceled, partially_refunded, refunded]
+        amount: { type: integer }
+        amount_refunded: { type: integer }
+        currency: { type: string }
+        method: { type: string }
+        next_action:
+          type: object
+          nullable: true
+          description: What the client must do next (redirect, open UPI intent, show QR).
+          properties:
+            type: { type: string, enum: [redirect, upi_intent, qr] }
+            url: { type: string }
+        attempts:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentAttempt' }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+        created: { type: string, format: date-time }
+    PaymentAttempt:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { type: string, example: mock_provider_a }
+        status: { type: string, enum: [pending, succeeded, failed] }
+        error_code: { type: string, nullable: true, example: issuer_unavailable }
+        latency_ms: { type: integer }
+        created: { type: string, format: date-time }
+    CreateRefund:
+      type: object
+      required: [amount]
+      properties:
+        amount: { type: integer, minimum: 1 }
+        reason: { type: string, enum: [customer_request, duplicate, fraudulent, other] }
+    Refund:
+      type: object
+      properties:
+        id: { type: string }
+        payment_intent_id: { type: string }
+        amount: { type: integer }
+        status: { type: string, enum: [pending, succeeded, failed] }
+        created: { type: string, format: date-time }
+    CreateMandate:
+      type: object
+      required: [type, max_amount, frequency, start_date]
+      properties:
+        type: { type: string, enum: [upi_autopay, nach] }
+        max_amount: { type: integer, description: Maximum debit per cycle, in paise }
+        frequency: { type: string, enum: [daily, weekly, monthly, quarterly, yearly, as_presented] }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+        customer:
+          type: object
+          properties:
+            id: { type: string }
+    Mandate:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string }
+        status: { type: string, enum: [pending_approval, active, paused, revoked, expired, failed] }
+        max_amount: { type: integer }
+        frequency: { type: string }
+        next_action:
+          type: object
+          nullable: true
+          properties:
+            type: { type: string, enum: [redirect, upi_intent] }
+            url: { type: string }
+    SettlementRecord:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { type: string }
+        provider_ref: { type: string }
+        payment_intent_id: { type: string, nullable: true }
+        expected_amount: { type: integer }
+        settled_amount: { type: integer }
+        status: { type: string, enum: [matched, unmatched, disputed] }
+        mismatch_reason: { type: string, nullable: true, example: amount_difference }
+        settlement_date: { type: string, format: date }
+    WebhookEvent:
+      type: object
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          enum:
+            - payment_intent.pending
+            - payment_intent.succeeded
+            - payment_intent.failed
+            - payment_intent.canceled
+            - refund.succeeded
+            - refund.failed
+            - mandate.activated
+            - mandate.revoked
+            - settlement.mismatch
+        created: { type: string, format: date-time }
+        data:
+          type: object
+          properties:
+            object: { type: object }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            type:
+              type: string
+              enum: [invalid_request, authentication_error, idempotency_error, rate_limit_error, payment_error, api_error]
+            code: { type: string, example: amount_too_small }
+            message: { type: string }
+            param: { type: string, nullable: true }
+            request_id: { type: string }
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    IdempotencyConflict:
+      description: Same Idempotency-Key reused with a different request body
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Valid JSON but failed business validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many requests; see Retry-After header
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
